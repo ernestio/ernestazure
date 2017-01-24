@@ -20,7 +20,7 @@ type Event struct {
 	ernestazure.Base
 	ID             string   `json:"id"`
 	Name           string   `json:"name"`
-	AddressSpaces  []string `json:"address_spaces"`
+	AddressSpace   []string `json:"address_space"`
 	DNSServerNames []string `json:"dns_server_names"`
 	Subnets        []subnet `json:"subnets"`
 	Location       string   `json:"location"`
@@ -114,17 +114,140 @@ func (ev *Event) Create() error {
 
 // Update : Updates a nat object on azure
 func (ev *Event) Update() error {
-	return errors.New(ev.Subject + " not supported")
+	mt := sync.Mutex{}
+
+	mc, err := ev.client()
+	vnetClient := virtualnetwork.NewClient(mc)
+
+	// Lock the client just before we get the virtual network configuration and immediately
+	// set an defer to unlock the client again whenever this function exits
+	mt.Lock()
+	defer mt.Unlock()
+
+	nc, err := vnetClient.GetVirtualNetworkConfiguration()
+	if err != nil {
+		return errors.New("Error retrieving Virtual Network Configuration: " + err.Error())
+	}
+
+	found := false
+	for i, n := range nc.Configuration.VirtualNetworkSites {
+		if n.Name == ev.ID {
+			network := ev.createVirtualNetwork()
+			nc.Configuration.VirtualNetworkSites[i] = network
+
+			found = true
+		}
+	}
+
+	if !found {
+		return errors.New("Virtual Network " + ev.ID + " does not exists!")
+	}
+
+	req, err := vnetClient.SetVirtualNetworkConfiguration(nc)
+	if err != nil {
+		return errors.New("Error updating Virtual Network " + ev.ID + ": " + err.Error())
+	}
+
+	// Wait until the virtual network is updated
+	if err := mc.WaitForOperation(req, nil); err != nil {
+		return errors.New("Error waiting for Virtual Network " + ev.ID + " to be updated: %s" + err.Error())
+	}
+
+	if err := ev.associateSecurityGroups(); err != nil {
+		return err
+	}
+
+	return ev.Get()
+
 }
 
 // Delete : Deletes a nat object on azure
 func (ev *Event) Delete() error {
-	return errors.New(ev.Subject + " not supported")
+	mt := sync.Mutex{}
+
+	mc, err := ev.client()
+	vnetClient := virtualnetwork.NewClient(mc)
+
+	// Lock the client just before we get the virtual network configuration and immediately
+	// set an defer to unlock the client again whenever this function exits
+	mt.Lock()
+	defer mt.Unlock()
+
+	nc, err := vnetClient.GetVirtualNetworkConfiguration()
+	if err != nil {
+		return errors.New("Error retrieving Virtual Network Configuration: " + err.Error())
+	}
+
+	filtered := nc.Configuration.VirtualNetworkSites[:0]
+	for _, n := range nc.Configuration.VirtualNetworkSites {
+		if n.Name != ev.ID {
+			filtered = append(filtered, n)
+		}
+	}
+
+	nc.Configuration.VirtualNetworkSites = filtered
+
+	req, err := vnetClient.SetVirtualNetworkConfiguration(nc)
+	if err != nil {
+		return errors.New("Error deleting Virtual Network " + ev.ID + ": " + err.Error())
+	}
+
+	// Wait until the virtual network is deleted
+	if err := mc.WaitForOperation(req, nil); err != nil {
+		return errors.New("Error waiting for Virtual Network " + ev.ID + " to be deleted: " + err.Error())
+	}
+
+	ev.ID = ""
+
+	return nil
+
 }
 
 // Get : Gets a nat object on azure
 func (ev *Event) Get() error {
-	return errors.New(ev.Subject + " not supported")
+	mc, err := ev.client()
+	vnetClient := virtualnetwork.NewClient(mc)
+	secGroupClient := networksecuritygroup.NewClient(mc)
+
+	nc, err := vnetClient.GetVirtualNetworkConfiguration()
+	if err != nil {
+		return errors.New("Error retrieving Virtual Network Configuration: " + err.Error())
+	}
+
+	for _, n := range nc.Configuration.VirtualNetworkSites {
+		if n.Name == ev.ID {
+			ev.AddressSpace = n.AddressSpace.AddressPrefix
+			ev.Location = n.Location
+
+			subnets := []subnet{}
+			// Loop through all endpoints
+			for _, s := range n.Subnets {
+
+				// Get the associated (if any) security group
+				sg, err := secGroupClient.GetNetworkSecurityGroupForSubnet(s.Name, ev.ID)
+				if err != nil && !management.IsResourceNotFoundError(err) {
+					return errors.New("Error retrieving Network Security Group associations of subnet " + s.Name + ": " + err.Error())
+				}
+
+				// Update the values
+				subnet := subnet{
+					Name:          s.Name,
+					AddressPrefix: s.AddressPrefix,
+					SecurityGroup: sg.Name,
+				}
+
+				subnets = append(subnets, subnet)
+			}
+
+			ev.Subnets = subnets
+
+			return nil
+		}
+	}
+
+	ev.ID = ""
+
+	return nil
 }
 
 func (ev *Event) createVirtualNetwork() virtualnetwork.VirtualNetworkSite {
@@ -151,7 +274,7 @@ func (ev *Event) createVirtualNetwork() virtualnetwork.VirtualNetworkSite {
 		Name:     ev.Name,
 		Location: ev.Location,
 		AddressSpace: virtualnetwork.AddressSpace{
-			AddressPrefix: ev.AddressSpaces,
+			AddressPrefix: ev.AddressSpace,
 		},
 		DNSServersRef: dnsRefs,
 		Subnets:       subnets,
