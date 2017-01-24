@@ -1,0 +1,15 @@
+machine:
+  environment:
+    ROOTPATH: /home/ubuntu/.go_workspace/src/github.com/ernestio
+
+dependencies:
+  pre:
+    - make dev-deps
+    - mkdir -p $ROOTPATH/
+    - rm -rf $ROOTPATH/ernestazure
+    - cp -R /home/ubuntu/ernestazure $ROOTPATH/ernestazure
+
+test:
+  override:
+    - cd $ROOTPATH/ernestazure && make test
+    - cd $ROOTPATH/ernestazure && make lint
