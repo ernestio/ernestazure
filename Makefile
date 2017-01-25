@@ -5,9 +5,8 @@ lint:
 	gometalinter --config .linter.conf
 
 deps:
-	echo "Not implemented... yet :("
+	glide install
 
-dev-deps:
-	go get -d github.com/Azure/azure-sdk-for-go
+dev-deps: deps
 	go get github.com/alecthomas/gometalinter
 	gometalinter --install

@@ -6,13 +6,12 @@ package vritualnetwork
 
 import (
 	"errors"
-	"sync"
+	"log"
+	"net/http"
 
+	"github.com/Azure/azure-sdk-for-go/arm/network"
 	"github.com/ernestio/ernestazure"
-
-	"github.com/Azure/azure-sdk-for-go/management"
-	"github.com/Azure/azure-sdk-for-go/management/networksecuritygroup"
-	"github.com/Azure/azure-sdk-for-go/management/virtualnetwork"
+	"github.com/ernestio/ernestazure/credentials"
 )
 
 // Event : ...
@@ -24,10 +23,18 @@ type Event struct {
 	DNSServerNames []string `json:"dns_server_names"`
 	Subnets        []subnet `json:"subnets"`
 	Location       string   `json:"location"`
-	ErrorMessage   string   `json:"error,omitempty"`
-	Subject        string   `json:"-"`
-	Body           []byte   `json:"-"`
-	CryptoKey      string   `json:"-"`
+	ClientID       string   `json:"azure_subscription_id"`
+	ClientSecret   string   `json:"azure_subscription_id"`
+	TenantID       string   `json:"azure_subscription_id"`
+	SubscriptionID string   `json:"azure_subscription_id"`
+
+	ResourceGroupName string             `json:"resource_group_name"`
+	Tags              map[string]*string `json:"tags"`
+
+	ErrorMessage string `json:"error,omitempty"`
+	Subject      string `json:"-"`
+	Body         []byte `json:"-"`
+	CryptoKey    string `json:"-"`
 }
 
 type subnet struct {
@@ -43,8 +50,15 @@ func New(subject string, body []byte, cryptoKey string) ernestazure.Event {
 	return &n
 }
 
+// Azure virtual network client
+func (ev *Event) client() *network.VirtualNetworksClient {
+	client, _ := credentials.Client(ev.ClientID, ev.ClientSecret, ev.TenantID, ev.SubscriptionID, ev.CryptoKey)
+	return &client.VirtualNetworkClient
+}
+
 // Validate checks if all criteria are met
 func (ev *Event) Validate() error {
+	// TOOD : Add validation rules
 	return nil
 }
 
@@ -53,280 +67,79 @@ func (ev *Event) Find() error {
 	return errors.New(ev.Subject + " not supported")
 }
 
-func (ev *Event) client() (management.Client, error) {
-	subscriptionID := "my subscription id"
-	settings := []byte("bla")
-
-	return management.ClientFromPublishSettingsData(settings, subscriptionID)
-}
-
 // Create : Creates a nat object on azure
 func (ev *Event) Create() error {
-	mt := sync.Mutex{}
+	c := ev.client()
 
-	mc, err := ev.client()
-	vnetClient := virtualnetwork.NewClient(mc)
+	log.Printf("[INFO] preparing arguments for Azure ARM virtual network creation.")
 
-	name := "Input name"
+	resGroup := ev.ResourceGroupName
 
-	// Lock the client just before we get the virtual network configuration and immediately
-	// set an defer to unlock the client again whenever this function exits
-	mt.Lock()
-	defer mt.Unlock()
+	vnet := network.VirtualNetwork{
+		Name:     &ev.Name,
+		Location: &ev.Location,
+		Tags:     &ev.Tags,
+	}
 
-	nc, err := vnetClient.GetVirtualNetworkConfiguration()
+	_, err := c.CreateOrUpdate(resGroup, ev.Name, vnet, make(chan struct{}))
 	if err != nil {
-		if management.IsResourceNotFoundError(err) {
-			// if no network config exists yet; create a new one now:
-			nc = virtualnetwork.NetworkConfiguration{}
-		} else {
-			return errors.New("Error retrieving Virtual Network Configuration: " + err.Error())
-		}
-	}
-
-	for _, n := range nc.Configuration.VirtualNetworkSites {
-		if n.Name == name {
-			return errors.New("Virtual Network " + name + " already exists")
-		}
-	}
-
-	network := ev.createVirtualNetwork()
-	nc.Configuration.VirtualNetworkSites = append(nc.Configuration.VirtualNetworkSites, network)
-
-	req, err := vnetClient.SetVirtualNetworkConfiguration(nc)
-	if err != nil {
-		return errors.New("Error creating Virtual Network " + name + ":" + err.Error())
-	}
-
-	// Wait until the virtual network is created
-	if err := mc.WaitForOperation(req, nil); err != nil {
-		return errors.New("Error waiting for Virtual Network " + name + " to be created: " + err.Error())
-	}
-
-	ev.ID = name
-
-	if err := ev.associateSecurityGroups(); err != nil {
 		return err
 	}
+
+	read, err := c.Get(resGroup, ev.Name, "")
+	if err != nil {
+		return err
+	}
+	if read.ID == nil {
+		return errors.New("Cannot read Virtual Network " + ev.Name + " (resource group " + resGroup + ") ID")
+	}
+
+	ev.ID = *read.ID
 
 	return ev.Get()
 }
 
 // Update : Updates a nat object on azure
 func (ev *Event) Update() error {
-	mt := sync.Mutex{}
-
-	mc, err := ev.client()
-	vnetClient := virtualnetwork.NewClient(mc)
-
-	// Lock the client just before we get the virtual network configuration and immediately
-	// set an defer to unlock the client again whenever this function exits
-	mt.Lock()
-	defer mt.Unlock()
-
-	nc, err := vnetClient.GetVirtualNetworkConfiguration()
-	if err != nil {
-		return errors.New("Error retrieving Virtual Network Configuration: " + err.Error())
-	}
-
-	found := false
-	for i, n := range nc.Configuration.VirtualNetworkSites {
-		if n.Name == ev.ID {
-			network := ev.createVirtualNetwork()
-			nc.Configuration.VirtualNetworkSites[i] = network
-
-			found = true
-		}
-	}
-
-	if !found {
-		return errors.New("Virtual Network " + ev.ID + " does not exists!")
-	}
-
-	req, err := vnetClient.SetVirtualNetworkConfiguration(nc)
-	if err != nil {
-		return errors.New("Error updating Virtual Network " + ev.ID + ": " + err.Error())
-	}
-
-	// Wait until the virtual network is updated
-	if err := mc.WaitForOperation(req, nil); err != nil {
-		return errors.New("Error waiting for Virtual Network " + ev.ID + " to be updated: %s" + err.Error())
-	}
-
-	if err := ev.associateSecurityGroups(); err != nil {
-		return err
-	}
-
-	return ev.Get()
-
+	return ev.Create()
 }
 
 // Delete : Deletes a nat object on azure
-func (ev *Event) Delete() error {
-	mt := sync.Mutex{}
+func (ev *Event) Delete() (err error) {
+	resGroup := ev.ResourceGroupName
+	name := ev.Name
 
-	mc, err := ev.client()
-	vnetClient := virtualnetwork.NewClient(mc)
+	_, err = ev.client().Delete(resGroup, name, make(chan struct{}))
 
-	// Lock the client just before we get the virtual network configuration and immediately
-	// set an defer to unlock the client again whenever this function exits
-	mt.Lock()
-	defer mt.Unlock()
-
-	nc, err := vnetClient.GetVirtualNetworkConfiguration()
-	if err != nil {
-		return errors.New("Error retrieving Virtual Network Configuration: " + err.Error())
-	}
-
-	filtered := nc.Configuration.VirtualNetworkSites[:0]
-	for _, n := range nc.Configuration.VirtualNetworkSites {
-		if n.Name != ev.ID {
-			filtered = append(filtered, n)
-		}
-	}
-
-	nc.Configuration.VirtualNetworkSites = filtered
-
-	req, err := vnetClient.SetVirtualNetworkConfiguration(nc)
-	if err != nil {
-		return errors.New("Error deleting Virtual Network " + ev.ID + ": " + err.Error())
-	}
-
-	// Wait until the virtual network is deleted
-	if err := mc.WaitForOperation(req, nil); err != nil {
-		return errors.New("Error waiting for Virtual Network " + ev.ID + " to be deleted: " + err.Error())
-	}
-
-	ev.ID = ""
-
-	return nil
-
+	return err
 }
 
 // Get : Gets a nat object on azure
 func (ev *Event) Get() error {
-	mc, err := ev.client()
-	vnetClient := virtualnetwork.NewClient(mc)
-	secGroupClient := networksecuritygroup.NewClient(mc)
+	resGroup := ev.ResourceGroupName
+	name := ev.Name
 
-	nc, err := vnetClient.GetVirtualNetworkConfiguration()
+	resp, err := ev.client().Get(resGroup, name, "")
 	if err != nil {
-		return errors.New("Error retrieving Virtual Network Configuration: " + err.Error())
+		return errors.New("Error making Read request on Azure virtual network " + name + ": " + err.Error())
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		ev.ID = ""
+		return nil
 	}
 
-	for _, n := range nc.Configuration.VirtualNetworkSites {
-		if n.Name == ev.ID {
-			ev.AddressSpace = n.AddressSpace.AddressPrefix
-			ev.Location = n.Location
+	// update appropriate values
+	ev.Name = *resp.Name
+	ev.Location = *resp.Location
+	ev.AddressSpace = *resp.AddressSpace.AddressPrefixes
+	// ev.Subnets = *resp.Subnets
 
-			subnets := []subnet{}
-			// Loop through all endpoints
-			for _, s := range n.Subnets {
-
-				// Get the associated (if any) security group
-				sg, err := secGroupClient.GetNetworkSecurityGroupForSubnet(s.Name, ev.ID)
-				if err != nil && !management.IsResourceNotFoundError(err) {
-					return errors.New("Error retrieving Network Security Group associations of subnet " + s.Name + ": " + err.Error())
-				}
-
-				// Update the values
-				subnet := subnet{
-					Name:          s.Name,
-					AddressPrefix: s.AddressPrefix,
-					SecurityGroup: sg.Name,
-				}
-
-				subnets = append(subnets, subnet)
-			}
-
-			ev.Subnets = subnets
-
-			return nil
-		}
+	dnses := []string{}
+	for _, dns := range *resp.DhcpOptions.DNSServers {
+		dnses = append(dnses, dns)
 	}
-
-	ev.ID = ""
-
-	return nil
-}
-
-func (ev *Event) createVirtualNetwork() virtualnetwork.VirtualNetworkSite {
-	// fetch address spaces:
-	var dnsRefs []virtualnetwork.DNSServerRef
-	var subnets []virtualnetwork.Subnet
-
-	// fetch DNS references:
-	for _, dns := range ev.DNSServerNames {
-		dnsRefs = append(dnsRefs, virtualnetwork.DNSServerRef{
-			Name: dns,
-		})
-	}
-
-	// Add all subnets that are configured
-	for _, subnet := range ev.Subnets {
-		subnets = append(subnets, virtualnetwork.Subnet{
-			Name:          subnet.Name,
-			AddressPrefix: subnet.AddressPrefix,
-		})
-	}
-
-	return virtualnetwork.VirtualNetworkSite{
-		Name:     ev.Name,
-		Location: ev.Location,
-		AddressSpace: virtualnetwork.AddressSpace{
-			AddressPrefix: ev.AddressSpace,
-		},
-		DNSServersRef: dnsRefs,
-		Subnets:       subnets,
-	}
-}
-
-func (ev *Event) associateSecurityGroups() error {
-	mc, _ := ev.client()
-	secGroupClient := networksecuritygroup.NewClient(mc)
-
-	for _, subnet := range ev.Subnets {
-		securityGroup := subnet.SecurityGroup
-		subnetName := subnet.Name
-
-		// Get the associated (if any) security group
-		sg, err := secGroupClient.GetNetworkSecurityGroupForSubnet(subnetName, ev.ID)
-		if err != nil && !management.IsResourceNotFoundError(err) {
-			return errors.New("Error retrieving Network Security Group associations of subnet " + subnetName + ": " + err.Error())
-		}
-
-		// If the desired and actual security group are the same, were done so can just continue
-		if sg.Name == securityGroup {
-			continue
-		}
-
-		// If there is an associated security group, make sure we first remove it from the subnet
-		if sg.Name != "" {
-			req, err := secGroupClient.RemoveNetworkSecurityGroupFromSubnet(sg.Name, subnetName, ev.Name)
-			if err != nil {
-				return errors.New("Error removing Network Security Group " + securityGroup + " from subnet " + subnetName + ": " + err.Error())
-			}
-
-			// Wait until the security group is associated
-			if err := mc.WaitForOperation(req, nil); err != nil {
-				return errors.New("Error waiting for Network Security Group " + securityGroup + " to be removed from subnet " + subnetName + ": " + err.Error())
-			}
-		}
-
-		// If the desired security group is not empty, assign the security group to the subnet
-		if securityGroup != "" {
-			req, err := secGroupClient.AddNetworkSecurityToSubnet(securityGroup, subnetName, ev.Name)
-			if err != nil {
-				return errors.New("Error associating Network Security Group " + securityGroup + " to subnet " + subnetName + ": " + err.Error())
-			}
-
-			// Wait until the security group is associated
-			if err := mc.WaitForOperation(req, nil); err != nil {
-				return errors.New("Error waiting for Network Security Group " + securityGroup + " to be associated with subnet : " + subnetName)
-			}
-		}
-
-	}
+	ev.DNSServerNames = dnses
+	ev.Tags = *resp.Tags
 
 	return nil
 }
